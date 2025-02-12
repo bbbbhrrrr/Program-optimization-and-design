@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <ctime>
 #include<cstdio>
+#include <iomanip>
 
 // 预计算的AES S盒和轮常数
 __constant__ unsigned char d_sbox[256] = {
@@ -460,18 +461,12 @@ __global__ void AES_Kernel(const unsigned char* input,
     __shared__ unsigned int s_roundKey[44];
 
     // 加载 T-table 和轮密钥到共享内存
-    if (threadIdx.x < 32) {
-      int base = threadIdx.x * 8;
-      for (int i = 0; i < 8; i++) {
-          int tIndex = base + i;
-          if (tIndex < 256) {
-              s_T0[tIndex] = d_T0[tIndex];
-              s_T1[tIndex] = d_T1[tIndex];
-              s_T2[tIndex] = d_T2[tIndex];
-              s_T3[tIndex] = d_T3[tIndex];
-          }
-      }
-  }
+    if (threadIdx.x < 256) {
+      s_T0[threadIdx.x] = d_T0[threadIdx.x];
+      s_T1[threadIdx.x] = d_T1[threadIdx.x];
+      s_T2[threadIdx.x] = d_T2[threadIdx.x];
+      s_T3[threadIdx.x] = d_T3[threadIdx.x];
+    }
 
     if (threadIdx.x == 0) {
         unsigned char expKey[176];
@@ -486,34 +481,52 @@ __global__ void AES_Kernel(const unsigned char* input,
     __syncthreads(); // 等待所有线程块加载完毕
 
     // 每个线程块处理 blocksPerThread 个数据块，即为粒度
+    // // 计算线程块负责的数据块区间
+    // int blockStart = blockIdx.x * blocksPerThread;
+    // int blockEnd = min(blockStart + blocksPerThread, numBlocks); // 确保不越界
 
-    // 计算线程块负责的数据块区间
+    // // 计算当前线程块内总数据块数
+    // int totalBlocks = blockEnd - blockStart;
+
+    // // 计算每个线程应处理的连续数据块数量
+    // int blocksPerThreadLocal = totalBlocks / blockDim.x;
+    // int remainder = totalBlocks % blockDim.x;
+
+    // // 当前线程处理起始数据块索引（连续区域）
+    // int threadStart = blockStart + threadIdx.x * blocksPerThreadLocal + min(threadIdx.x, remainder);
+
+    // // 当前线程需要处理的数据块数
+    // int threadCount = blocksPerThreadLocal + (threadIdx.x < remainder ? 1 : 0);
+
+    // for (int i = 0; i < threadCount; i++) {
+    //   int dataBlockIdx = threadStart + i;
+    //   if (dataBlockIdx >= numBlocks) break; // 边界检查
+
     int blockStart = blockIdx.x * blocksPerThread;
-    int blockEnd = blockStart + blocksPerThread;
-    if (blockEnd > numBlocks) blockEnd = numBlocks;
+    int blockEnd = min(blockStart + blocksPerThread, numBlocks); // 确保不越界
+    
+    // 让所有线程交错地处理任务
+    for (int dataBlockIdx = blockStart + threadIdx.x; dataBlockIdx < blockEnd; dataBlockIdx += blockDim.x) {
+        // 加载明文、加密及写回操作
 
-    // 每个线程处理 blockStart 到 blockEnd 之间的数据块
-    for (int dataBlockIdx = blockStart + threadIdx.x; 
-      dataBlockIdx < blockEnd; 
-      dataBlockIdx += blockDim.x) {
-     if (dataBlockIdx >= numBlocks) break;
+      int base = dataBlockIdx * 16;
 
-     // 计算数据块基地址
-     int base = dataBlockIdx * 16;
-
-
-    // int idx = blockIdx.x * blockDim.x * blocksPerThread + threadIdx.x;
-    // for (int i = 0; i < blocksPerThread; i++) {
-    //     if (idx >= numBlocks) break; // 超出数据块范围的线程块直接退出
-
-    // // 加载明文到 state
-    // int base = idx * 16;
+    // 加载明文到 state
     unsigned int state[4];
+
     state[0] = (input[base+0] << 24) | (input[base+1] << 16) | (input[base+2] << 8) | (input[base+3]);
     state[1] = (input[base+4] << 24) | (input[base+5] << 16) | (input[base+6] << 8) | (input[base+7]);
     state[2] = (input[base+8] << 24) | (input[base+9] << 16) | (input[base+10] << 8) | (input[base+11]);
-    state[3] = (input[base+12] << 24)| (input[base+13] << 16)| (input[base+14] << 8)| (input[base+15]);
+    state[3] = (input[base+12] << 24)| (input[base+13] << 16)| (input[base+14] << 8)| (input[base+15])
 
+    // // 使用 uint4 类型一次性读取 16 字节数据
+    // uint4* input4 = (uint4*)(input + base);
+    // unsigned int state[4];
+    // state[0] = input4->x;
+    // state[1] = input4->y;
+    // state[2] = input4->z;
+    // state[3] = input4->w;
+    
     // 初始轮密钥加
     state[0] ^= s_roundKey[0];
     state[1] ^= s_roundKey[1];
@@ -634,9 +647,9 @@ int main() {
 
 
     // 启动核函数配置
-    int threadsPerBlock = 32; // 每个线程块的线程数量
+    int threadsPerBlock = 1024; // 每个线程块的线程数量
     int blocksPerThread = 2048;  // 每个线程块处理的数据块数
-    int blocksPerGrid = (numBlocks + threadsPerBlock * blocksPerThread - 1) / (threadsPerBlock * blocksPerThread);
+    int blocksPerGrid = (numBlocks ) / (blocksPerThread)+1;
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -654,7 +667,7 @@ int main() {
 
     // 计算吞吐量
     size_t total_data_size = padded_len; // 总数据量（字节）
-    float memory_throughput = (total_data_size * 2) / (milliseconds / 1000.0f) / 1e9; // GB/s
+    float memory_throughput = (total_data_size ) / (milliseconds / 1000.0f) / 1e9; // GB/s
 
     std::cout << "Execution time: " << milliseconds << " ms\n";
     std::cout << "Memory throughput: " << memory_throughput << " GB/s\n";
@@ -667,16 +680,32 @@ int main() {
     cudaDeviceSynchronize();
     cudaMemcpy(h_output, d_output, padded_len, cudaMemcpyDeviceToHost);
     
-    // 输出验证前32字节，查看正确性
-    std::cout << "Original data:\n";
-    for (int i = 0; i < 32; ++i)
-        printf("%02x ", h_input[i]);
+    //输出验证后1024字节数据，以及加密后1024字节数据，验证加密正确性
+
+    std::cout << "Original data (last 1024 bytes):\n";
+    for (int i = padded_len - 1024; i < padded_len; ++i) {
+      std::cout << std::hex << std::setw(2) << std::setfill('0')
+              << static_cast<int>(h_input[i]) << " ";
+    }
     std::cout << "\n";
 
-    std::cout << "Encrypted data:\n";
-    for (int i = 0; i < 32; ++i)
-        printf("%02x ", h_output[i]);
+    std::cout << "\nEncrypted data (last 1024 bytes):\n";
+    for (int i = padded_len - 1024; i < padded_len; ++i) {
+      std::cout << std::hex << std::setw(2) << std::setfill('0')
+              << static_cast<int>(h_output[i]) << " ";
+    }
     std::cout << "\n";
+
+
+    // std::cout << "Original data:\n";
+    // for (int i = 0; i < padded_len; ++i)
+    //     printf("%02x ", h_input[i]);
+    // std::cout << "\n";
+
+    // std::cout << "Encrypted data:\n";
+    // for (int i = 0; i < padded_len; ++i)
+    //     printf("%02x ", h_output[i]);
+    // std::cout << "\n";
 
     // 释放资源
     delete[] h_input;
