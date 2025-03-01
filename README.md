@@ -1,5 +1,5 @@
 # Program-optimization-and-design
-这是一个关于程序优化与设计的项目，包含了ntt多线程加速、SIMD指令集加速以及cache行为仿真。
+这是一个关于程序优化与设计的项目，包含了ntt多线程加速、SIMD指令集加速、AES的并行加速以及cache行为仿真。
 
 ## 主要内容
 - NTT 多线程优化：通过线程拆分实现 NTT 加速。
