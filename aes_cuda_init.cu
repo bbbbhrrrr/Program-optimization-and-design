@@ -1,4 +1,4 @@
-﻿#include <iostream>
+#include <iostream>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <ctime>
@@ -431,112 +431,93 @@ __device__ void AddRoundKey(unsigned char* state, const unsigned char* roundKey,
     state[i] ^= roundKey[round*16 + i];
   }
 }
-
-__device__ inline uint32_t Rot(uint32_t value, int rotation) {
-    switch(rotation){
-        case 8:  // 8-bit right rotation
-            return __byte_perm(value, value, 0x00004321);
-        case 16: // 16-bit right rotation
-            return __byte_perm(value, value, 0x00005432);
-        case 24: // 24-bit right rotation
-            return __byte_perm(value, value, 0x00006543);
-        default:
-            return value;
-    }
-}
-
 __global__ void AES_Kernel(uint4* input, uint4* output, int numBlocks, int blocksPerThread) {
-    // 共享内存： 复制 32 份 T0 表，消除 Bank Conflict
-    __shared__ uint32_t s_T0[32][256];
-    __shared__ uint4 s_rk[11];
+  // 共享内存声明
+  __shared__ uint32_t s_T0[256], s_T1[256], s_T2[256], s_T3[256];
+  __shared__ uint4 s_rk[11];
 
-    // 加载 T0 的 32 份副本到共享内存
-    for (int bank = 0; bank < 32; bank++) {
-        for (int i = threadIdx.x; i < 256; i += blockDim.x) {
-            s_T0[bank][i] = d_T0[i];
-        }
-    }
+  // 加载T-table到共享内存
+  for(int i = threadIdx.x; i < 256; i += blockDim.x) {
+      s_T0[i] = d_T0[i];
+      s_T1[i] = d_T1[i];
+      s_T2[i] = d_T2[i];
+      s_T3[i] = d_T3[i];
+  }
 
-    // 加载轮密钥到共享内存
-    if (threadIdx.x < 11) {
-        s_rk[threadIdx.x] = d_roundKeys[threadIdx.x];
-    }
-    __syncthreads();
+  // 加载轮密钥到共享内存
+  if(threadIdx.x < 11) {
+      s_rk[threadIdx.x] = d_roundKeys[threadIdx.x];
+  }
 
-    // 每个线程选择自己的 Bank（依赖于线程 ID）
-    int my_bank = threadIdx.x & 31; // 等价于 threadIdx.x % 32
+  __syncthreads();  // 等待所有线程完成加载
 
-    int blockStart = blockIdx.x * blocksPerThread;
-    int blockEnd = min(blockStart + blocksPerThread, numBlocks);
+  int blockStart = blockIdx.x * blocksPerThread;
+  int blockEnd = min(blockStart + blocksPerThread, numBlocks); // 确保不越界
+  
+  // 每个线程以交错方式处理多个数据块
+  for (int dataBlockIdx = blockStart + threadIdx.x; 
+	   dataBlockIdx < blockEnd; 
+	   dataBlockIdx += blockDim.x) {
+  
+	  // 这里直接使用dataBlockIdx作为数据块索引
+	  uint4 data = input[dataBlockIdx];
 
-    // 每个线程以交错方式处理多个数据块
-    for (int dataBlockIdx = blockStart + threadIdx.x;
-         dataBlockIdx < blockEnd;
-         dataBlockIdx += blockDim.x) {
+      // 初始轮密钥加
+      data.x ^= s_rk[0].x;
+      data.y ^= s_rk[0].y;
+      data.z ^= s_rk[0].z;
+      data.w ^= s_rk[0].w;
 
-        // 加载数据块并做初始轮密钥加
-        uint4 data = input[dataBlockIdx];
-        data.x ^= s_rk[0].x;
-        data.y ^= s_rk[0].y;
-        data.z ^= s_rk[0].z;
-        data.w ^= s_rk[0].w;
+      // 中间9轮加密
+      for(int round = 1; round <= 9; ++round) {
+          uint4 tmp;
+          tmp.x = s_T0[(data.x >> 24) & 0xFF] ^ 
+                  s_T1[(data.y >> 16) & 0xFF] ^ 
+                  s_T2[(data.z >>  8) & 0xFF] ^ 
+                  s_T3[data.w & 0xFF] ^ s_rk[round].x;
+          
+          tmp.y = s_T0[(data.y >> 24) & 0xFF] ^ 
+                  s_T1[(data.z >> 16) & 0xFF] ^ 
+                  s_T2[(data.w >>  8) & 0xFF] ^ 
+                  s_T3[data.x & 0xFF] ^ s_rk[round].y;
+          
+          tmp.z = s_T0[(data.z >> 24) & 0xFF] ^ 
+                  s_T1[(data.w >> 16) & 0xFF] ^ 
+                  s_T2[(data.x >>  8) & 0xFF] ^ 
+                  s_T3[data.y & 0xFF] ^ s_rk[round].z;
+          
+          tmp.w = s_T0[(data.w >> 24) & 0xFF] ^ 
+                  s_T1[(data.x >> 16) & 0xFF] ^ 
+                  s_T2[(data.y >>  8) & 0xFF] ^ 
+                  s_T3[data.z & 0xFF] ^ s_rk[round].w;
+          
+          data = tmp;
+      }
 
-        // 中间 9 轮加密
-        #pragma unroll
-        for (int round = 1; round <= 9; ++round) {
-            uint4 tmp;
-            // 计算 tmp.x
-			tmp.x = s_T0[my_bank][ (data.x >> 24) & 0xFF ] 
-			^ Rot(s_T0[my_bank][ (data.y >> 16) & 0xFF ], 8)
-			^ Rot(s_T0[my_bank][ (data.z >> 8)  & 0xFF ], 16)
-			^ Rot(s_T0[my_bank][  data.w        & 0xFF ], 24)
-			^ s_rk[round].x;
-
-            // 计算 tmp.y
-			tmp.y = s_T0[my_bank][ (data.y >> 24) & 0xFF ]
-			^ Rot(s_T0[my_bank][ (data.z >> 16) & 0xFF ], 8)
-			^ Rot(s_T0[my_bank][ (data.w >> 8)  & 0xFF ], 16)
-			^ Rot(s_T0[my_bank][  data.x        & 0xFF ], 24)
-			^ s_rk[round].y;
-
-			// 计算 tmp.z
-			tmp.z = s_T0[my_bank][ (data.z >> 24) & 0xFF ]
-			^ Rot(s_T0[my_bank][ (data.w >> 16) & 0xFF ], 8)
-			^ Rot(s_T0[my_bank][ (data.x >> 8)  & 0xFF ], 16)
-			^ Rot(s_T0[my_bank][  data.y        & 0xFF ], 24)
-			^ s_rk[round].z;
-
-			// 计算 tmp.w
-			tmp.w = s_T0[my_bank][ (data.w >> 24) & 0xFF ]
-			^ Rot(s_T0[my_bank][ (data.x >> 16) & 0xFF ], 8)
-			^ Rot(s_T0[my_bank][ (data.y >> 8)  & 0xFF ], 16)
-			^ Rot(s_T0[my_bank][  data.z        & 0xFF ], 24)
-			^ s_rk[round].w;
-			
-            data = tmp;
-        }
-
-        // 最后一轮（直接使用 S-box 与轮密钥，不使用 T-table）
-        uint4 out;
-        out.x = (((d_sbox[(data.x >> 24) & 0xFF] << 24) |
-                  (d_sbox[(data.y >> 16) & 0xFF] << 16) |
-                  (d_sbox[(data.z >> 8)  & 0xFF] << 8)  |
-                  d_sbox[data.w & 0xFF]) ^ s_rk[10].x);
-        out.y = (((d_sbox[(data.y >> 24) & 0xFF] << 24) |
-                  (d_sbox[(data.z >> 16) & 0xFF] << 16) |
-                  (d_sbox[(data.w >> 8)  & 0xFF] << 8)  |
-                  d_sbox[data.x & 0xFF]) ^ s_rk[10].y);
-        out.z = (((d_sbox[(data.z >> 24) & 0xFF] << 24) |
-                  (d_sbox[(data.w >> 16) & 0xFF] << 16) |
-                  (d_sbox[(data.x >> 8)  & 0xFF] << 8)  |
-                  d_sbox[data.y & 0xFF]) ^ s_rk[10].z);
-        out.w = (((d_sbox[(data.w >> 24) & 0xFF] << 24) |
-                  (d_sbox[(data.x >> 16) & 0xFF] << 16) |
-                  (d_sbox[(data.y >> 8)  & 0xFF] << 8)  |
-                  d_sbox[data.z & 0xFF]) ^ s_rk[10].w);
-
-        output[dataBlockIdx] = out;
-    }
+      // 最后一轮
+	  uint4 out;
+	  out.x = (((d_sbox[(data.x >> 24) & 0xFF] << 24) |
+			   (d_sbox[(data.y >> 16) & 0xFF] << 16) |
+			   (d_sbox[(data.z >>  8) & 0xFF] <<  8) |
+			   d_sbox[data.w & 0xFF]) ^ s_rk[10].x);
+	  
+	  out.y = (((d_sbox[(data.y >> 24) & 0xFF] << 24) |
+			   (d_sbox[(data.z >> 16) & 0xFF] << 16) |
+			   (d_sbox[(data.w >>  8) & 0xFF] <<  8) |
+			   d_sbox[data.x & 0xFF]) ^ s_rk[10].y);
+	  
+	  out.z = (((d_sbox[(data.z >> 24) & 0xFF] << 24) |
+			   (d_sbox[(data.w >> 16) & 0xFF] << 16) |
+			   (d_sbox[(data.x >>  8) & 0xFF] <<  8) |
+			   d_sbox[data.y & 0xFF]) ^ s_rk[10].z);
+	  
+	  out.w = (((d_sbox[(data.w >> 24) & 0xFF] << 24) |
+			   (d_sbox[(data.x >> 16) & 0xFF] << 16) |
+			   (d_sbox[(data.y >>  8) & 0xFF] <<  8) |
+			   d_sbox[data.z & 0xFF]) ^ s_rk[10].w);
+      
+      output[dataBlockIdx] = out;
+  }
 }
 
 int main() {
